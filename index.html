@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#111318">
+  <title>Phishing URL Classifier</title>
+  <link rel="stylesheet" href="./style.css">
+  <style>
+    .phishing-main { max-width: 760px; padding-bottom: 2rem; }
+    .phishing-main .page-heading { margin: 2rem 0 1.25rem; }
+    .phishing-main .page-heading p { color: var(--quiet); }
+    .phishing-main .panel label { margin-top: .9rem; }
+    .phishing-actions { margin-top: 1.15rem; }
+    .phishing-actions button { width: 100%; }
+    .phishing-status { font-size: .8rem; color: var(--quiet); margin: .8rem 0 0; }
+    .phishing-status.error { color: var(--critical-ink); }
+    .phishing-result { margin-top: 1rem; padding: 1.1rem 1.4rem; background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--cyan); border-radius: 4px; }
+    .phishing-result.phishing-risk { border-left-color: var(--critical); }
+    .phishing-result.legitimate { border-left-color: var(--success); }
+    .phishing-result strong { display: block; font-size: 1.8rem; font-weight: 650; line-height: 1.2; margin-top: .2rem; }
+    .phishing-result.phishing-risk strong { color: var(--critical-ink); }
+    .phishing-result.legitimate strong { color: var(--success); }
+    .phishing-result .confidence { color: var(--quiet); margin: .55rem 0 0; font-size: .86rem; }
+    @media (max-width: 520px) { .phishing-main .page-heading { margin-top: 1.25rem; } }
+  </style>
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">P</span><span>Phishing Classifier <small>PYTORCH / ONNX</small></span></div>
+  </header>
+  <main class="phishing-main">
+    <div class="page-heading">
+      <div>
+        <p class="eyebrow">CLASSIFICATION / URL ANALYSIS</p>
+        <h1>Phishing URL detection</h1>
+        <p>Enter a website link to classify its URL structure.</p>
+      </div>
+    </div>
+    <section class="panel" aria-labelledby="url-heading">
+      <h2 id="url-heading">Website URL</h2>
+      <form id="url-form">
+        <label for="url">URL
+          <input id="url" type="url" inputmode="url" placeholder="https://example.com/login" required autocomplete="off" spellcheck="false">
+        </label>
+        <div class="phishing-actions"><button id="classify" type="submit" disabled>Loading model...</button></div>
+      </form>
+      <p class="phishing-status" id="status" role="status" aria-live="polite">Loading ONNX model...</p>
+    </section>
+    <section id="result" class="phishing-result" aria-live="polite" hidden>
+      <span class="eyebrow">MODEL PREDICTION</span>
+      <strong id="prediction">—</strong>
+      <p id="confidence" class="confidence"></p>
+    </section>
+  </main>
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js"></script>
+  <script>
+    let session;
+    const form = document.getElementById('url-form');
+    const status = document.getElementById('status');
+    const button = document.getElementById('classify');
+    const result = document.getElementById('result');
+    const prediction = document.getElementById('prediction');
+    const confidence = document.getElementById('confidence');
+
+    function extractUrlFeatures(input) {
+      const url = input.trim();
+      if (!/^https?:\/\//i.test(url)) throw new Error('Enter a complete URL starting with http:// or https://.');
+      const parsed = new URL(url);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('Only HTTP and HTTPS URLs are supported.');
+
+      const authorityAndPath = url.slice(url.indexOf('://') + 3);
+      const authorityEnd = authorityAndPath.search(/[/?#]/);
+      const authority = authorityEnd === -1 ? authorityAndPath : authorityAndPath.slice(0, authorityEnd);
+      const hostAndPort = authority.slice(authority.lastIndexOf('@') + 1);
+      let hostname;
+      if (hostAndPort.startsWith('[')) {
+        hostname = hostAndPort.slice(1, hostAndPort.indexOf(']'));
+      } else {
+        hostname = hostAndPort.split(':')[0];
+      }
+      hostname = hostname.toLowerCase();
+      if (!hostname) throw new Error('The URL must contain a hostname.');
+
+      const afterAuthority = authorityEnd === -1 ? '' : authorityAndPath.slice(authorityEnd);
+      const path = afterAuthority.startsWith('/') ? afterAuthority.split(/[?#]/, 1)[0] : '';
+      const ipv4Parts = hostname.split('.');
+      const ipv4 = ipv4Parts.length === 4 && ipv4Parts.every(p => /^(0|[1-9]\d*)$/.test(p) && Number(p) <= 255);
+      const ipv6 = hostAndPort.startsWith('[') && hostname.includes(':');
+      const count = char => url.split(char).length - 1;
+      const digitCount = Array.from(url).filter(c => /\p{Decimal_Number}/u.test(c)).length;
+      const urlLength = Array.from(url).length;
+      const hostLength = Array.from(hostname).length;
+      const pathLength = Array.from(path).length;
+
+      return [
+        urlLength, hostLength, /^https:\/\//i.test(url) ? 1 : 0, (ipv4 || ipv6) ? 1 : 0,
+        count('.'), count('-'), count('@'), count('?'),
+        count('='), digitCount, pathLength,
+        Math.max(0, hostname.split('.').length - 2),
+        count('/'), count('&')
+      ];
+    }
+
+    async function loadModel() {
+      try {
+        if (!window.ort) throw new Error('ONNX Runtime Web did not load.');
+        session = await ort.InferenceSession.create('./phishing_model.onnx', { executionProviders: ['wasm'] });
+        if (session.inputNames.length !== 1 || session.outputNames.length !== 1) {
+          throw new Error('Unexpected ONNX input/output structure.');
+        }
+        button.disabled = false;
+        button.textContent = 'Classify URL';
+        status.textContent = 'Model ready';
+        status.classList.remove('error');
+      } catch (error) {
+        status.textContent = 'Model failed to load: ' + error.message;
+        status.classList.add('error');
+        button.textContent = 'Model unavailable';
+        button.disabled = true;
+      }
+    }
+
+    form.addEventListener('submit', async function (event) {
+      event.preventDefault();
+      if (!session) return;
+      result.hidden = true;
+      button.disabled = true;
+      status.classList.remove('error');
+      status.textContent = 'Classifying URL...';
+      try {
+        const features = extractUrlFeatures(document.getElementById('url').value);
+        const input = new ort.Tensor('float32', new Float32Array(features), [1, 14]);
+        const output = await session.run({ [session.inputNames[0]]: input });
+        const scores = Array.from(output[session.outputNames[0]].data);
+        if (scores.length !== 2 || !scores.every(Number.isFinite)) throw new Error('The model returned an invalid prediction.');
+        const top = Math.max(...scores);
+        const probabilities = scores.map(v => Math.exp(v - top));
+        const total = probabilities[0] + probabilities[1];
+        const phishingChance = probabilities[1] / total;
+        const phishing = phishingChance >= 0.5;
+        result.className = 'phishing-result ' + (phishing ? 'phishing-risk' : 'legitimate');
+        prediction.textContent = phishing ? 'Phishing' : 'Legitimate';
+        confidence.textContent = 'Model confidence: ' + ((phishing ? phishingChance : 1 - phishingChance) * 100).toFixed(1) + '%';
+        result.hidden = false;
+        status.textContent = 'Prediction complete';
+      } catch (error) {
+        status.textContent = 'Prediction failed: ' + error.message;
+        status.classList.add('error');
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    loadModel();
+  </script>
+</body>
+</html>
